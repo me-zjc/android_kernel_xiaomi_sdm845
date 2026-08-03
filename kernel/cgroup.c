@@ -1305,7 +1305,7 @@ static struct kernfs_syscall_ops cgroup_kf_syscall_ops;
 static const struct file_operations proc_cgroupstats_operations;
 
 static char *cgroup_file_name(struct cgroup *cgrp, const struct cftype *cft,
-			      char *buf)
+				      char *buf)
 {
 	struct cgroup_subsys *ss = cft->ss;
 
@@ -1315,8 +1315,58 @@ static char *cgroup_file_name(struct cgroup *cgrp, const struct cftype *cft,
 			 cgroup_on_dfl(cgrp) ? ss->name : ss->legacy_name,
 			 cft->name);
 	else
-		strncpy(buf, cft->name, CGROUP_FILE_NAME_MAX);
+		strlcpy(buf, cft->name, CGROUP_FILE_NAME_MAX);
 	return buf;
+}
+
+static char *cgroup_noprefix_link_name(struct cgroup *cgrp,
+					       const struct cftype *cft, char *buf)
+{
+	struct cgroup_subsys *ss = cft->ss;
+	int len;
+
+	if (!ss || cgroup_on_dfl(cgrp) || !(cgrp->root->flags & CGRP_ROOT_NOPREFIX) ||
+	    (cft->flags & CFTYPE_NO_PREFIX))
+		return NULL;
+
+	len = strlen(ss->legacy_name);
+	if (!strncmp(cft->name, ss->legacy_name, len) && cft->name[len] == '.')
+		return NULL;
+
+	if (snprintf(buf, CGROUP_FILE_NAME_MAX, "%s.%s", ss->legacy_name,
+		     cft->name) >= CGROUP_FILE_NAME_MAX)
+		return NULL;
+
+	return buf;
+}
+
+static void cgroup_add_noprefix_link(struct cgroup *cgrp,
+					     const struct cftype *cft,
+					     struct kernfs_node *target)
+{
+	char name[CGROUP_FILE_NAME_MAX];
+	struct kernfs_node *kn;
+	char *link_name;
+
+	link_name = cgroup_noprefix_link_name(cgrp, cft, name);
+	if (!link_name)
+		return;
+
+	kn = kernfs_create_link(cgrp->kn, link_name, target);
+	if (IS_ERR(kn) && PTR_ERR(kn) != -EEXIST)
+		pr_warn_ratelimited("failed to add cgroup compat link %s, err=%ld\n",
+				    link_name, PTR_ERR(kn));
+}
+
+static void cgroup_rm_noprefix_link(struct cgroup *cgrp,
+					    const struct cftype *cft)
+{
+	char name[CGROUP_FILE_NAME_MAX];
+	char *link_name;
+
+	link_name = cgroup_noprefix_link_name(cgrp, cft, name);
+	if (link_name)
+		kernfs_remove_by_name(cgrp->kn, link_name);
 }
 
 /**
@@ -1475,6 +1525,7 @@ static void cgroup_rm_file(struct cgroup *cgrp, const struct cftype *cft)
 		spin_unlock_irq(&cgroup_file_kn_lock);
 	}
 
+	cgroup_rm_noprefix_link(cgrp, cft);
 	kernfs_remove_by_name(cgrp->kn, cgroup_file_name(cgrp, cft, name));
 }
 
@@ -3845,6 +3896,8 @@ static int cgroup_add_file(struct cgroup_subsys_state *css, struct cgroup *cgrp,
 		cfile->kn = kn;
 		spin_unlock_irq(&cgroup_file_kn_lock);
 	}
+
+	cgroup_add_noprefix_link(cgrp, cft, kn);
 
 	return 0;
 }
